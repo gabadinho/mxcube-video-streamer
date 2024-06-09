@@ -1,4 +1,4 @@
-name: video-streamer
+name: mxcube_video_streamer
 channels:
   - conda-forge
 dependencies:

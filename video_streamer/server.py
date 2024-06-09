@@ -1,11 +1,12 @@
 import os
+import time
 
 from fastapi import FastAPI, WebSocket, Request, WebSocketDisconnect
 from fastapi.responses import StreamingResponse, HTMLResponse
 from fastapi.staticfiles import StaticFiles
 
 from video_streamer.core.websockethandler import WebsocketHandler
-from video_streamer.core.streamer import FFMPGStreamer, MJPEGStreamer
+from video_streamer.core.streamer import FFMPGStreamer, MJPEGStreamer, MJPEGDuoStreamer
 from fastapi.templating import Jinja2Templates
 
 
@@ -98,4 +99,47 @@ def create_mpeg1_app(config, host, port, debug):
     return app
 
 
-available_applications = {"MPEG1": create_mpeg1_app, "MJPEG": create_mjpeg_app}
+def create_mjpegduo_app(config, host, port, debug):
+    app = FastAPI()
+    streamer = MJPEGDuoStreamer(config, host, port, debug)
+    ui_template_root = os.path.join(os.path.dirname(__file__), "ui/template")
+    templates = Jinja2Templates(directory=ui_template_root)
+
+    @app.get("/ui", response_class=HTMLResponse)
+    async def video_ui(request: Request):
+        return templates.TemplateResponse(
+            "index_mjpeg.html",
+            {
+                "request": request,
+                "source": f"http://localhost:{port}/video/{config.hash}",
+            },
+        )
+
+    @app.get(f"/video/{config.hash}")
+    def video_feed():
+        return StreamingResponse(
+            streamer.start(), media_type='multipart/x-mixed-replace;boundary="!>"'
+        )
+
+    @app.get("/shutdown")
+    def shutdown_request():
+        streamer.stop()
+        time.sleep(0.1)
+        os._exit(0)
+
+    @app.on_event("startup")
+    async def startup():
+        pass
+
+    @app.on_event("shutdown")
+    async def shutdown():
+        streamer.stop()
+
+    return app
+
+
+available_applications = {
+    "MPEG1": create_mpeg1_app,
+    "MJPEG": create_mjpeg_app,
+    "MJPEGDUO": create_mjpegduo_app,
+}
