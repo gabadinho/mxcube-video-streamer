@@ -19,8 +19,15 @@ import requests
 
 class MJPEGDuoStreamer(Device):
 
+    VIDEO_URI    = "/video/"
+    SHUTDOWN_URI = "/shutdown"
+
+    SHUTDOWN_SLEEP = 1.0
+    KILL_SLEEP     = 0.1
+
     host = device_property(dtype=str, doc='Host name', default_value="0.0.0.0")
     port = device_property(dtype=int, doc='Port number', default_value=8000)
+
     exposure_time = device_property(dtype=float, doc='Expected exposure time', default_value=0.05)
 
     primary_camera = device_property(dtype=str, doc='Primary camera Tango URI', mandatory=True)
@@ -77,68 +84,73 @@ class MJPEGDuoStreamer(Device):
              dtype_out=None, doc_out='')
     def startStreaming(self):
         if self.streamerProcess is None:
-            #host, port = "0.0.0.0", "8002"
-            host, port = "84.89.220.50", "8002"
-            video_uri = "/video/"
-            oav = {
+            host = self.host
+            port = self.port
+            duo_config = {
                 "format": "MJPEGDUO",
                 "input_uri": (
-                        "tango://84.89.220.53:9999/bl06/oav/bzoom#dbase=no",
-                        "bl06/limaccds/oavhires"
-
+                    self.primary_camera,
+                    self.secondary_camera
                 ),
-                "exposure_time": 0.05,
+                "exposure_time": self.exposure_time,
                 "size": (
-                    (0, 0),
-                    (0, 0)
+                    self.primary_resize,
+                    self.secondary_resize
                 ),
                 "crop": (
-                    (0, 0),
-                    (0, 0)
+                    self.primary_crop,
+                    self.secondary_crop
                 ),
-                "rotate": (90, 0),
+                "rotate": (
+                    self.primary_rotate,
+                    self.secondary_rotate
+                ),
                 "flip": (
-                    (True, False),
-                    (False, False),
+                    self.primary_flip,
+                    self.secondary_flip
                 )
             }
+            
             logging.debug("Starting MJPEG video streamer...")
-            self.streamerProcess = self.fork_uvicorn_server(host, port, oav)
+            self.streamerProcess = self.fork_uvicorn_server(host, port, duo_config)
             if self.streamerProcess.is_alive():
-                self.videoURL = "{}:{}{}".format(host, port, video_uri)
+                self.videoURL = "{}:{}{}".format(host, port, MJPEGDuoStreamer.VIDEO_URI)
                 logging.info("Streaming on {}".format(self.videoURL))
+                self.startedHost = host
+                self.startedPort = port
             else:
                 logging.error("Something went wrong")
                 p_pid = self.streamerProcess.pid
                 try:
                     logging.info("Killing pid={}".format(p_pid))
                     os.kill(p_pid, signal.SIGTERM)
-                    time.sleep(0.1)
+                    time.sleep(MJPEGDuoStreamer.KILL_SLEEP)
                     os.kill(p_pid, signal.SIGKILL)
                 except:
                     pass
                 self.streamerProcess = None
                 self.videoURL = ""
-
+                self.startedHost = ""
+                self.startedPort = ""
 
     @command(dtype_in=None, doc_in='',
              dtype_out=None, doc_out='')
     def shutdownStream(self):
         if self.streamerProcess is not None:
             p_pid = self.streamerProcess.pid
-            host, port = "84.89.220.50", "8002"
+            host, port = self.startedHost, self.startedPort
             shutdown_uri = "shutdown"
             logging.info("Requesting a controlled shutdown...")
             try:
-                requests.get("http://{}:{}/{}".format(host, port, shutdown_uri), timeout=0.1)
+                requests.get("http://{}:{}{}".format(host, port, MJPEGDuoStreamer.SHUTDOWN_URI), timeout=0.1)
             except Exception as ex:
                 print(str(ex))
             finally:
-                time.sleep(1.0)
+                time.sleep(MJPEGDuoStreamer.SHUTDOWN_SLEEP)
             try:
                 logging.info("Killing pid={} just to make sure".format(p_pid))
                 os.kill(p_pid, signal.SIGTERM)
-                time.sleep(0.1)
+                time.sleep(MJPEGDuoStreamer.KILL_SLEEP)
                 os.kill(p_pid, signal.SIGKILL)
             except:
                 pass
@@ -152,6 +164,8 @@ class MJPEGDuoStreamer(Device):
 
         self.streamerProcess = None
         self.videoURL = ""
+        self.startedHost = ""
+        self.startedPort = ""
 
         if not self.primary_camera:
             logging.error("The property 'primary_camera' must be set")
@@ -178,8 +192,8 @@ class MJPEGDuoStreamer(Device):
 
     def fork_uvicorn_server(self, host, port, multisource_dict):
         p = None
+
         app_config = get_multisource_config_from_dict(multisource_dict)
-    
         app = create_app(app_config, host, int(port), debug=True)
         if app:
             logging.debug("Created FastAPI application")
