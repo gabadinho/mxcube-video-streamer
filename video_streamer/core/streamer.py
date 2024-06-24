@@ -2,11 +2,14 @@ import subprocess
 import multiprocessing
 import queue
 import time
+import copy
 from typing import Tuple
+import threading
+
+import asyncio
 
 from video_streamer.core.camera import TestCamera, LimaCamera, MJPEGCamera, LimaCameraDuo
 from video_streamer.core.config import SourceConfiguration
-
 
 class Streamer:
     def __init__(self, config: SourceConfiguration, host: str, port: int, debug: bool):
@@ -43,7 +46,7 @@ class MJPEGStreamer(Streamer):
         )
         self._poll_image_p.start()
 
-        last_frame = _q.get()
+        _last_frame = _q.get()
 
         out_size = self._config.size if self._config.size[0] else self._camera.size
 
@@ -53,11 +56,11 @@ class MJPEGStreamer(Streamer):
             except queue.Empty:
                 pass
             else:
-                last_frame = _data
+                _last_frame = _data
 
             yield (
                 b"--frame\r\n--!>\nContent-type: image/jpeg\n\n"
-                + self._camera.get_jpeg(last_frame, out_size)
+                + self._camera.get_jpeg(_last_frame, out_size)
                 + b"\r\n"
             )
 
@@ -159,10 +162,15 @@ class FFMPGStreamer(Streamer):
 
 
 class MJPEGDuoStreamer(Streamer):
-    def __init__(self, config: SourceConfiguration, host: str, port: int, debug: bool):
+    def __init__(self, config: SourceConfiguration, host: str, port: int, uvicorn_loop, fastapi_request, debug: bool=False):
         super().__init__(config, host, port, debug)
         self._poll_image_p = None
         self._expt = self._config.exposure_time
+        self._last_frame = None
+        self._uvicorn_loop = uvicorn_loop
+        self._fastapi_request = fastapi_request
+        
+        #self.am_i_connected = None
 
         if not isinstance(self._config.input_uri, list):
             raise ValueError("MJPEGDuoStreamer requires a input_uri list")
@@ -177,36 +185,58 @@ class MJPEGDuoStreamer(Streamer):
             crop = self._config.crop,
             rotate = self._config.rotate,
             flip = self._config.flip,
-            debug = True)
+            debug = debug
+        )
+
+    #def not_dead_yet(self, task_result):
+    #    print("************* NOT_DEAD_YET!!!", task_result)
+    #    self.am_i_connected = True
 
     def start(self) -> None:
         if self._poll_image_p is None:
             _q = multiprocessing.Queue(1)
 
             self._poll_image_p = multiprocessing.Process(
-                target=self._camera.poll_image, args=(_q,)
+                target = self._camera.poll_image, args=(_q,)
             )
             self._poll_image_p.start()
-
-            last_frame = _q.get()
 
             while True:
                 try:
                     _data = _q.get_nowait()
                 except queue.Empty:
-                    pass
+                    _data = self._last_frame
+                except:
+                    continue
+
+                camera_index, jpeg = self._camera.get_jpeg(_data)
+                if jpeg is not None:
+                    self._last_frame = _data
+                    try:
+                        yield (
+                            b"--frame\r\n-----MXCuBEMJPEGDuoStreamer\nContent-type: image/jpeg\n\n"
+                            + jpeg
+                            + b"\r\n"
+                        )
+                    except Exception as ex:
+                        print(str(ex))
+                    time.sleep(self._expt[camera_index])
                 else:
-                    last_frame = _data
+                    time.sleep(1.0)
 
-                yield (
-                    b"--frame\r\n--!>\nContent-type: image/jpeg\n\n"
-                    + self._camera.get_jpeg(last_frame)
-                    + b"\r\n"
-                )
-
-                time.sleep(self._expt)
+                #self.am_i_connected = False
+                #task = self._uvicorn_loop.create_task(self._fastapi_request.is_disconnected())
+                #task.add_done_callback(self.not_dead_yet)
 
     def stop(self) -> None:
         if self._poll_image_p:
+            self._uvicorn_loop.create_task(self._fastapi_request.close())
             self._poll_image_p.kill()
             self._poll_image_p = None
+
+    def get_last_jpeg(self) -> bytearray:
+        last_frame = copy.copy(self._last_frame)
+        jpeg_data = None
+        if last_frame is not None:
+            camera_index, jpeg_data = self._camera.get_jpeg(last_frame, dont_resize=True)
+        return jpeg_data

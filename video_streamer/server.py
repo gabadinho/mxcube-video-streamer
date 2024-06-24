@@ -1,8 +1,11 @@
 import os
+import sys
 import time
+import logging
+import asyncio
 
-from fastapi import FastAPI, WebSocket, Request, WebSocketDisconnect
-from fastapi.responses import StreamingResponse, HTMLResponse
+from fastapi import FastAPI, WebSocket, Request, WebSocketDisconnect, HTTPException
+from fastapi.responses import StreamingResponse, HTMLResponse, Response
 from fastapi.staticfiles import StaticFiles
 
 from video_streamer.core.websockethandler import WebsocketHandler
@@ -100,10 +103,12 @@ def create_mpeg1_app(config, host, port, debug):
 
 
 def create_mjpegduo_app(config, host, port, debug):
+
     app = FastAPI()
-    streamer = MJPEGDuoStreamer(config, host, port, debug)
     ui_template_root = os.path.join(os.path.dirname(__file__), "ui/template")
     templates = Jinja2Templates(directory=ui_template_root)
+
+    client2streamer = {}
 
     @app.get("/ui", response_class=HTMLResponse)
     async def video_ui(request: Request):
@@ -111,29 +116,57 @@ def create_mjpegduo_app(config, host, port, debug):
             "index_mjpeg.html",
             {
                 "request": request,
-                "source": f"http://localhost:{port}/video/{config.hash}",
+                "source": f"{request.base_url}video/{config.hash}",
             },
         )
 
     @app.get(f"/video/{config.hash}")
-    def video_feed():
+    def video_feed(request: Request):
+        try:
+            streamer = client2streamer[(request.client.host,request.client.port)]
+        except KeyError:
+            if len(client2streamer) >= config.max_concurrent_streams:
+                goodbye_client = list(client2streamer.keys())[0]
+                goodbye_stream = client2streamer[goodbye_client]
+                logging.warning("Reached maximum concurrent streams, closing stream of client {}:{}".format(goodbye_client[0],goodbye_client[1]))
+                goodbye_stream.stop()
+                client2streamer.pop(goodbye_client)
+                goodbye_stream = None
+
+            logging.info("Starting new streamer to client {}:{}".format(request.client.host,request.client.port))
+            streamer = MJPEGDuoStreamer(config, host, port, app.my_loop, request, debug)
+            client2streamer[(request.client.host,request.client.port)] = streamer
         return StreamingResponse(
-            streamer.start(), media_type='multipart/x-mixed-replace;boundary="!>"'
+            streamer.start(), media_type='multipart/x-mixed-replace;boundary="---MXCuBEMJPEGDuoStreamer"'
         )
 
     @app.get("/shutdown")
-    def shutdown_request():
-        streamer.stop()
+    def shutdown_request(request: Request):
+        for client, streamer in client2streamer.items():
+            streamer.stop()
         time.sleep(0.1)
-        os._exit(0)
+        sys.exit(0)
+
+    @app.get("/last_image")
+    async def last_image(request: Request):
+        try:
+            last_client = list(client2streamer.keys())[-1]
+            last_stream = client2streamer[last_client]
+        except (IndexError, KeyError):
+            logging.error("No streamer available")
+            raise HTTPException(status_code=404, detail="Last image not found")
+        last_jpeg = last_stream.get_last_jpeg()
+        return Response(content=last_jpeg, media_type="image/jpg")
 
     @app.on_event("startup")
     async def startup():
-        pass
+        app.my_loop = asyncio.get_event_loop()
 
     @app.on_event("shutdown")
     async def shutdown():
-        streamer.stop()
+        for client, streamer in client2streamer.items():
+            streamer.stop()
+        client2streamer = {}        
 
     return app
 
